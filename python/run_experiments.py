@@ -27,6 +27,7 @@ from operator import itemgetter
 from scipy.stats import pearsonr, spearmanr
 from sklearn.model_selection import ParameterGrid
 from vuamc import Vuamc
+import tensorflow as tf
 
 import csv
 import matplotlib
@@ -39,6 +40,7 @@ import pickle
 import random
 import re
 import pandas as pd
+from DirectRanker.models.DirectRanker import DirectRanker
 
 
 # data paths
@@ -421,7 +423,7 @@ def use_bws(a1_train, a2_train, pair_idx, prefs_train, samples=10000):
     
     return generate_bws(pair_idx, y, samples)
 
-def train(training_split, train_idxs, idx_instance_list, embeddings, bws=False, samples=10000):
+def train(training_split, train_idxs, idx_instance_list, embeddings, bws=False, samples=10000, use_dr=False):
     """
     Train a model using the given training set.
 
@@ -445,22 +447,52 @@ def train(training_split, train_idxs, idx_instance_list, embeddings, bws=False, 
     # following ES' advice here
     ninducing = min(len(train_idxs), OPTIONS['ninducing'])
 
-    model = GPPrefLearning(ninput_features=items_feat.shape[1],
-                           kernel_func=OPTIONS['kernelfunc'],  # 'matern_3_2' is default, 'diagonal' is used for testing without features
-                           ls_initial=ls_initial,
-                           verbose=False,
-                           shape_s0=2.0,
-                           rate_s0=200.0,
-                           rate_ls=rate_ls,
-                           use_svi=True,
-                           ninducing=ninducing,
-                           max_update_size=200,
-                           kernel_combination='*',
-                           forgetting_rate=0.7,
-                           delay=1.0)
+    if use_dr:
+        model = DirectRanker(
+                    # DirectRanker HPs
+                    hidden_layers_dr=[256, 128, 64, 20],
+                    feature_activation_dr='tanh',
+                    ranking_activation_dr='tanh',
+                    feature_bias_dr=True,
+                    kernel_initializer_dr=tf.random_normal_initializer,
+                    kernel_regularizer_dr=0.0,
+                    drop_out=0.5,
+                    # Common HPs
+                    scale_factor_train_sample=5,
+                    batch_size=200,
+                    loss=tf.keras.losses.MeanSquaredError(),
+                    learning_rate=0.001,
+                    learning_rate_decay_rate=1,
+                    learning_rate_decay_steps=1000,
+                    optimizer=tf.keras.optimizers.Adam,
+                    epoch=10,
+                    # other variables
+                    verbose=2,
+                    validation_size=0.0,
+                    num_features=items_feat.shape[1],
+                    random_seed=42,
+                    name="DirectRanker",
+                    dtype=tf.float32,
+                    print_summary=False,
+                )
+    else:
+        model = GPPrefLearning(ninput_features=items_feat.shape[1],
+                            kernel_func=OPTIONS['kernelfunc'],  # 'matern_3_2' is default, 'diagonal' is used for testing without features
+                            ls_initial=ls_initial,
+                            verbose=False,
+                            shape_s0=2.0,
+                            rate_s0=200.0,
+                            rate_ls=rate_ls,
+                            use_svi=True,
+                            ninducing=ninducing,
+                            max_update_size=200,
+                            kernel_combination='*',
+                            forgetting_rate=0.7,
+                            delay=1.0)
 
-    model.max_iter_VB = 2000
-
+        model.max_iter_VB = 2000
+    
+    
     # in the data loading step we already sorted each pair, preference-descending wise,
     # i.e. the first instance is always the preferred (more funny, more novel) one
     prefs_train = [1] * len(a1_train)  # 1: a1 preferred over (i.e. more novel/funny than) a2, using input_type='binary'
@@ -471,7 +503,10 @@ def train(training_split, train_idxs, idx_instance_list, embeddings, bws=False, 
         a1_train, a2_train, prefs_train = use_bws(a1_train, a2_train, pair_idx, prefs_train, samples=samples)
     print("items_feat", items_feat.shape)
     print('a1_train', np.array(a1_train).shape, 'a2_train', np.array(a2_train).shape, 'prefs_train', np.array(prefs_train).shape)
-    model.fit(np.array(a1_train), np.array(a2_train), items_feat, np.array(prefs_train, dtype=float), optimize=OPTIONS['optimization'], input_type='binary')
+    if use_dr:
+        model.fit_gppl(np.array(a1_train), np.array(a2_train), items_feat, np.array(prefs_train, dtype=float), optimize=OPTIONS['optimization'], input_type='binary')
+    else:
+        model.fit(np.array(a1_train), np.array(a2_train), items_feat, np.array(prefs_train, dtype=float), optimize=OPTIONS['optimization'], input_type='binary')
     logging.info("**** Completed training GPPL ****")
 
     return model
@@ -491,7 +526,7 @@ def load_model(path):
         return pickle.load(f)
 
 
-def run(cut, cut_mode, bws, samples):
+def run(cut, cut_mode, bws, samples, use_dr):
     """
     Run a given configuration.
     """
@@ -526,12 +561,16 @@ def run(cut, cut_mode, bws, samples):
         train_split, train_idxs, dev_idxs, test_idxs = split_data(pairs, idx_instance_list, train_perc, dev_perc, test_perc, cut=cut, cut_mode=cut_mode)
 
     # train model on cut
-    model = train(train_split, train_idxs, idx_instance_list, embeddings, bws, samples)
-    save_model(model, OPTIONS['experiment_dir'], output_filename)
+    model = train(train_split, train_idxs, idx_instance_list, embeddings, bws, samples, use_dr)
+    if not use_dr:
+        save_model(model, OPTIONS['experiment_dir'], output_filename)
 
     # apply model to dev split
     dev_feats = extract_features(dev_idxs, idx_instance_list, embeddings, add_feats=OPTIONS['add_features'])
-    predicted_f, _ = model.predict_f(out_feats=dev_feats)
+    if use_dr:
+        predicted_f = model.predict_proba(dev_feats)
+    else:
+        predicted_f, _ = model.predict_f(out_feats=dev_feats)
     predicted = dict(zip(dev_idxs, [float(p) for p in predicted_f]))
 
     rows = []
@@ -615,7 +654,7 @@ if __name__ == '__main__':
         print('Usage: run_experiments.py task cuts(comma-separated list of percentages of training data to use)')
         exit()
     
-    # Results
+    # Results GPPL
     # | Data | Normal | DR Samples       | Samples     |
     # |------|--------|------------------|-------------|
     # | 10%  | 0.474  | 0.467/0.408      | 10k/50k     |
@@ -623,8 +662,17 @@ if __name__ == '__main__':
     # | 33%  | 0.520  | 0.492/0.538      | 10k/50k     |
     # | 66%  | 0.514  | 0.534/0.532      | 10k/50k     |
     
+    # Results DR
+    # | Data | Normal | DR Samples       | Samples     |
+    # |------|--------|------------------|-------------|
+    # | 10%  | 0.496  | 0.448/0.430      | 10k/50k     |
+    # | 20%  | 0.505  | 0.503/0.443      | 10k/50k     |
+    # | 33%  | 0.515  | 0.524/0.471      | 10k/50k     |
+    # | 66%  | 0.535  | 0.530/0.493      | 10k/50k     |
+    
     bws = True
-    samples = 10000
+    samples = 50000
+    use_dr = True
 
     task = sys.argv[1]
     param_grid['cut'] = [float(c) for c in sys.argv[2].split(',')] if len(sys.argv) > 2 else [None]
@@ -678,4 +726,4 @@ if __name__ == '__main__':
         random.seed(rnd_seed)
         np.random.seed(np_seed)
 
-        run(OPTIONS['cut'], OPTIONS['cut_mode'], bws, samples)
+        run(OPTIONS['cut'], OPTIONS['cut_mode'], bws, samples, use_dr)
