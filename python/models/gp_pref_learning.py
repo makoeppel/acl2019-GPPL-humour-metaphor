@@ -364,7 +364,7 @@ class GPPrefLearning(GPClassifierSVI):
             raise ValueError('input_type for preference labels must be either "binary" or "zero-centered"')
 
         #TODO: bug fix: if the same object is reused with different set of items, there is a crash because K_nm is not renewed.
-
+        
         super(GPPrefLearning, self).fit((items1_coords, items2_coords), preferences, totals, process_obs,
                                 mu0=mu0, K=K, optimize=optimize, use_median_ls=use_median_ls, features=item_features)
 

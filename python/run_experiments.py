@@ -38,15 +38,17 @@ import os
 import pickle
 import random
 import re
+import pandas as pd
 
 
 # data paths
 HUMOUR_DATA_PATH = './data/pl-humor-full/results.tsv'
-HUMOUR_BWS_SCORES_PATH = './data/bws/item_scores.txt'
+HUMOUR_BWS_SCORES_PATH = './data/pl-humor-full/item_scores.txt'
 METAPHOR_DATA_PATH = './data/vuamc_crowd/all.csv'
 VUAMC_PATH = './data/VU Amsterdam Metaphor Corpus/2541/VUAMC_with_novelty_scores.xml'
 NGRAMS_PATH = './data/ngrams/en/{}_{}grams.csv'  # task, n
 FREQUENCIES_PATH = './data/resources/wikipedia_2017_frequencies.pkl'
+bws_path = './data/pl-humor-full/item_scores.txt'
 
 # set numpy seed
 rnd_seed = 41
@@ -90,10 +92,20 @@ def split_data(pairs, idx_instance_list, train_size=0.6, dev_size=0.2, test_size
     idxs = list(range(len(idx_instance_list)))
     random.shuffle(idxs)
     logging.info('Shuffling data... [%s, ...]', ', '.join([str(i) for i in idxs[:10]]))
-
-    train_idxs = idxs[:int(len(idxs) * train_size)]
-    dev_idxs = idxs[int(len(idxs) * train_size):-int(len(idxs) * test_size)]
-    test_idxs = idxs[int(-len(idxs) * test_size):]
+    
+    if os.path.isfile("train_idxs.npy"):
+        idxs = np.load("idxs.npy")
+        train_idxs = np.load("train_idxs.npy")
+        dev_idxs = np.load("dev_idxs.npy")
+        test_idxs = np.load("test_idxs.npy")
+    else:
+        train_idxs = idxs[:int(len(idxs) * train_size)]
+        dev_idxs = idxs[int(len(idxs) * train_size):-int(len(idxs) * test_size)]
+        test_idxs = idxs[int(-len(idxs) * test_size):]
+        np.save("idxs", idxs)
+        np.save("train_idxs", train_idxs)
+        np.save("dev_idxs", dev_idxs)
+        np.save("test_idxs", test_idxs)
 
     # only use pairs for training which have both idxs in the train_idxs set
     train_pairs = []
@@ -122,7 +134,6 @@ def split_data(pairs, idx_instance_list, train_size=0.6, dev_size=0.2, test_size
         else:
             raise ValueError('cut_mode needs to be one of [random_instances, random_pairs]')
         logging.info('Using "%s", choosing %s train_pairs...', cut_mode, len(cut_train_pairs))
-
         # change training idxs as well, to enable faster feature extraction
         remaining_idxs = set()
         for pair in train_pairs:
@@ -146,7 +157,7 @@ def split_data(pairs, idx_instance_list, train_size=0.6, dev_size=0.2, test_size
                 else:
                     raise ValueError('Instance should be list (humour) or str (metaphor).')
         train_pairs = cut_train_pairs
-
+        
     return train_pairs, train_idxs, dev_idxs, test_idxs
 
 
@@ -351,8 +362,66 @@ def extract_features(requested_idxs, idx_instance_list, embeddings, add_feats):
         logging.info('  Normalized dimension %s by factor %s', dim, norm_factor)
     return feature_vectors
 
+def generate_bws(x_train, y_rankings, samples):
+    x0 = []
+    x1 = []
+    feat = []
+    y=np.ones(samples)
 
-def train(training_split, train_idxs, idx_instance_list, embeddings):
+    indices = np.random.randint(0, len(x_train), samples)
+
+    for counter,idx_0 in enumerate(indices):
+
+        idx_1= random.choice(list(set(range(len(x_train))).difference(set([idx_0]))))
+        #idx_1 =( np.random.randint(-around, around, 1)[0]+idx_0)%len(x_train)
+
+        if y_rankings[idx_0]>y_rankings[idx_1]:
+            x0.append(x_train[idx_0])
+            x1.append(x_train[idx_1])
+        elif y_rankings[idx_0]<y_rankings[idx_1]:
+            x0.append(x_train[idx_0])
+            x1.append(x_train[idx_1])
+            y[counter]=0
+        else:
+            # else we do NOT take the samples because the rankings are equal!
+            x0.append(x_train[idx_0])
+            x1.append(x_train[idx_1])
+            y[counter]=0.5
+
+    x0 = np.array(x0)
+    x1 = np.array(x1)
+    return x0, x1, y
+
+def use_bws(a1_train, a2_train, pair_idx, prefs_train, samples=10000):
+    # read in gold values
+    idx_l = []
+    a_l = [] # cnt how much time idx was 1
+    b_l = [] # cnt how much time idx was 0
+    for idx in pair_idx:
+        a_l_cur = 0
+        b_l_cur = 0
+        for a1 in a1_train:
+            if idx == a1:
+                a_l_cur += 1
+        for a2 in a2_train:
+            if idx == a2:
+                b_l_cur += 1
+        idx_l.append(idx)
+        a_l.append(a_l_cur)
+        b_l.append(b_l_cur)
+    y = []
+
+    for i in range(len(idx_l)):
+        if len(a1_train) > 0:
+            bws_score = a_l[i] / len(a1_train) - b_l[i] / len(a1_train)
+        else:
+            bws_score = 0
+        y.append(bws_score)
+    y = np.array(y)
+    
+    return generate_bws(pair_idx, y, samples)
+
+def train(training_split, train_idxs, idx_instance_list, embeddings, bws=False, samples=10000):
     """
     Train a model using the given training set.
 
@@ -368,7 +437,6 @@ def train(training_split, train_idxs, idx_instance_list, embeddings):
     # re-assign indexes based on position in the index list (this makes a*_train compatible with the order of items_feat)
     a1_train = [train_idxs.index(idx) for idx in a1_train]
     a2_train = [train_idxs.index(idx) for idx in a2_train]
-
 #    ls_initial = compute_median_lengthscales(items_feat)
 #    rate_ls=1.0 / np.mean(ls_initial),
     ls_initial = None  # default
@@ -398,6 +466,9 @@ def train(training_split, train_idxs, idx_instance_list, embeddings):
     prefs_train = [1] * len(a1_train)  # 1: a1 preferred over (i.e. more novel/funny than) a2, using input_type='binary'
 
     logging.info("**** Started training GPPL ****")
+    if bws:
+        pair_idx = np.unique(np.concatenate([a1_train, a2_train]))
+        a1_train, a2_train, prefs_train = use_bws(a1_train, a2_train, pair_idx, prefs_train, samples=samples)
     print("items_feat", items_feat.shape)
     print('a1_train', np.array(a1_train).shape, 'a2_train', np.array(a2_train).shape, 'prefs_train', np.array(prefs_train).shape)
     model.fit(np.array(a1_train), np.array(a2_train), items_feat, np.array(prefs_train, dtype=float), optimize=OPTIONS['optimization'], input_type='binary')
@@ -420,7 +491,7 @@ def load_model(path):
         return pickle.load(f)
 
 
-def run(cut, cut_mode):
+def run(cut, cut_mode, bws, samples):
     """
     Run a given configuration.
     """
@@ -431,7 +502,13 @@ def run(cut, cut_mode):
     # data and embeddings loading
     # TODO we can cut loading times by doing this only once, instead of for each run
     # currently, we retain the flexibility of loading e.g. different embeddings
-    pairs, idx_instance_list = load_crowd_data(OPTIONS['task'])
+    if os.path.isfile("pairs.npy"):
+        pairs = np.load("pairs.npy")
+        idx_instance_list = np.load("idx_instance_list.npy")
+    else:
+        pairs, idx_instance_list = load_crowd_data(OPTIONS['task'])
+        np.save("pairs", pairs)
+        np.save("idx_instance_list", idx_instance_list)
     embeddings = load_embeddings(path=OPTIONS['emb_path'] + OPTIONS['task'])
 
     # training/dev/test set randomization and splitting
@@ -449,7 +526,7 @@ def run(cut, cut_mode):
         train_split, train_idxs, dev_idxs, test_idxs = split_data(pairs, idx_instance_list, train_perc, dev_perc, test_perc, cut=cut, cut_mode=cut_mode)
 
     # train model on cut
-    model = train(train_split, train_idxs, idx_instance_list, embeddings)
+    model = train(train_split, train_idxs, idx_instance_list, embeddings, bws, samples)
     save_model(model, OPTIONS['experiment_dir'], output_filename)
 
     # apply model to dev split
@@ -528,7 +605,7 @@ param_grid['emb_path'] = ['data/GoogleNews-vectors-negative300.vocab_sub_']
 param_grid['optimization'] = [False]  #, True]
 # no features, all, and ablation
 features = ['frequency', 'polysemy', 'ngrams']  # available features
-param_grid['add_features'] = list(chain.from_iterable(combinations(features, r) for r in [0, len(features) - 1, len(features)]))
+#param_grid['add_features'] = list(chain.from_iterable(combinations(features, r) for r in [0, len(features) - 1, len(features)]))
 param_grid['task4'] = [False]
 
 # run grid of options
@@ -537,6 +614,17 @@ if __name__ == '__main__':
     if len(sys.argv) < 2:
         print('Usage: run_experiments.py task cuts(comma-separated list of percentages of training data to use)')
         exit()
+    
+    # Results
+    # | Data | Normal | DR Samples       | Samples     |
+    # |------|--------|------------------|-------------|
+    # | 10%  | 0.474  | 0.467/0.408      | 10k/50k     |
+    # | 20%  | 0.500  | 0.458/0.461      | 10k/50k     |
+    # | 33%  | 0.520  | 0.492/0.538      | 10k/50k     |
+    # | 66%  | 0.514  | 0.534/0.532      | 10k/50k     |
+    
+    bws = True
+    samples = 10000
 
     task = sys.argv[1]
     param_grid['cut'] = [float(c) for c in sys.argv[2].split(',')] if len(sys.argv) > 2 else [None]
@@ -558,12 +646,12 @@ if __name__ == '__main__':
     if param_grid['cut'] == [None]:
         param_grid['cut_mode'] = [None]
     else:
-        param_grid['cut_mode'] = ['random_instances', 'random_pairs']
+        param_grid['cut_mode'] = 'random_instances',# 'random_pairs']
         if task == 'metaphor':
             param_grid['add_features'] = [('frequency', 'ngrams')]
             logging.warn('Using only best feature combination: %s', param_grid['add_features'])
         elif task == 'humour':
-            param_grid['add_features'] = [('frequency', 'ngrams')]
+            param_grid['add_features'] = [('frequency',)]# 'ngrams')]
             logging.warn('Using only best feature combination: %s', param_grid['add_features'])
 
     # initialize tools and resources
@@ -590,4 +678,4 @@ if __name__ == '__main__':
         random.seed(rnd_seed)
         np.random.seed(np_seed)
 
-        run(OPTIONS['cut'], OPTIONS['cut_mode'])
+        run(OPTIONS['cut'], OPTIONS['cut_mode'], bws, samples)

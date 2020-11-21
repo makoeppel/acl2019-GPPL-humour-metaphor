@@ -27,11 +27,13 @@ import os
 import pickle
 import random
 import re
+import pandas as pd
 
 # data paths
 humour_path = './data/pl-humor-full/results.tsv'
 metaphor_path = './data/vuamc_crowd/all.csv'
 vuamc_path = './data/VU Amsterdam Metaphor Corpus/2541/VUAMC_with_novelty_scores.xml'
+bws_path = './data/pl-humor-full/item_scores.txt'
 
 # output data path
 overview_file = 'overview.csv'
@@ -167,6 +169,62 @@ def extract_features(requested_idxs):
     feature_vectors.shape += (1,)
     return feature_vectors
 
+def read_bow_data(path, use_id_sentences=True):
+    input=open(path,"r")
+    data=json.load(input)
+    input.close()
+    if use_id_sentences:
+        bag_of_words=data['id_sentences']#'bag_of_words'#'id_sentences'
+    else:
+        bag_of_words=data['bag_of_words']
+    train_val_list = []#data["train_val_list"]
+    ngram_idx=data['ngram_idx']
+    train_pairs=data['train_pairs']
+    test_pairs=data['test_pairs']
+    min_counts=0#data['min_counts']
+    n=0#data['n']
+    sentences=data["sentences"]
+    #numpy_bow=bow_to_numpy_arr(bag_of_words,len(ngram_idx))
+    numpy_bow=np.asarray(bag_of_words)
+    return numpy_bow,ngram_idx,train_pairs,test_pairs,min_counts,n,sentences,train_val_list
+
+def use_bws2(x_train, y_rankings, samples):
+    x0 = []
+    x1 = []
+    y=np.ones((samples, 1))
+
+    indices = np.random.randint(0, len(x_train), samples)
+
+    for counter,idx_0 in enumerate(indices):
+
+        idx_1= random.choice(list(set(range(len(x_train))).difference(set([idx_0]))))
+        #idx_1 =( np.random.randint(-around, around, 1)[0]+idx_0)%len(x_train)
+
+        if y_rankings[idx_0]>y_rankings[idx_1]:
+            x0.append(x_train[idx_0])
+            x1.append(x_train[idx_1])
+        elif y_rankings[idx_0]<y_rankings[idx_1]:
+            x0.append(x_train[idx_0])
+            x1.append(x_train[idx_1])
+            y[counter]=-1
+        else:
+            # else we do NOT take the samples because the rankings are equal!
+            x0.append(x_train[idx_0])
+            x1.append(x_train[idx_1])
+            y[counter]=0
+
+    x0 = np.array(x0)
+    x1 = np.array(x1)
+    return x0, x1, y
+
+def use_bws():
+    gold = pd.read_csv(bws_path, sep="\t", header=None)
+    gold = gold.reset_index()
+    gold = gold.rename(columns={0: 'bow_idx'})
+    gold = gold.rename(columns={1: 'Ranking'})
+    gold = gold.rename(columns={'Index': 'gold'})
+    
+    print(gold[gold["bow_idx"] == 3397])
 
 def train(train_split, train_idxs, idx_instance_list, task):
     """
@@ -181,7 +239,7 @@ def train(train_split, train_idxs, idx_instance_list, task):
 
     items_feat = extract_features(train_idxs)  # needs to be mapped to the ids used in the training_splits
     a1_train, a2_train = zip(*train_split)
-
+    print(len(a1_train))
     # re-assign indexes based on position in the index list (this makes a*_train compatible with the order of items_feat)
     a1_train = [train_idxs.index(idx) for idx in a1_train]
     a2_train = [train_idxs.index(idx) for idx in a2_train]
@@ -219,6 +277,14 @@ def train(train_split, train_idxs, idx_instance_list, task):
     logging.info("**** Started training GPPL ****")
     print("items_feat", items_feat.shape)
     print('a1_train', np.array(a1_train).shape, 'a2_train', np.array(a2_train).shape, 'prefs_train', np.array(prefs_train).shape)
+    
+    print(a1_train) # item id
+    print(a2_train) # item id
+    print(prefs_train) # this is y
+    print(items_feat)
+    use_bws()
+    exit()
+    
     model.fit(np.array(a1_train), np.array(a2_train), items_feat, np.array(prefs_train, dtype=float), optimize=OPTIONS['optimization'], input_type='binary')
     logging.info("**** Completed training GPPL ****")
 
@@ -248,7 +314,14 @@ def run(task, experiment_dir):
     start_time = datetime.now()
 
     if task == 'humour':
-        pairs, idx_instance_list = load_crowd_data_TM(humour_path)
+        if os.path.isfile("pairs.npy"):
+            pairs = np.load("pairs.npy")
+            idx_instance_list = np.load("idx_instance_list.npy")
+            print(idx_instance_list)
+        else:
+            pairs, idx_instance_list = load_crowd_data_TM(humour_path)
+            np.save("pairs", pairs)
+            np.save("idx_instance_list", idx_instance_list)
         vuamc = None
     elif task == 'metaphor':
         pairs, idx_instance_list = load_crowd_data_ED(metaphor_path)
