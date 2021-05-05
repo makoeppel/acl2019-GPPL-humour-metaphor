@@ -1,8 +1,34 @@
 import numpy as np
 import tensorflow as tf
+import tensorflow_probability as tfp
 
 from sklearn.base import BaseEstimator
 import gc
+
+class RBFKernelFn(tf.keras.layers.Layer):
+    
+    def __init__(self, **kwargs):
+        super(RBFKernelFn, self).__init__()
+        
+        dtype = kwargs.get('dtype', None)
+
+        self._amplitude = self.add_variable(
+            initializer=tf.constant_initializer(0),
+            dtype=dtype,
+            name='amplitude')
+
+        self._length_scale = self.add_variable(
+            initializer=tf.constant_initializer(0),
+            dtype=dtype,
+            name='length_scale')
+
+    def call(x):
+        return x
+
+    @property
+    def kernel(self):
+        return tfp.math.psd_kernels.ExponentiatedQuadratic(amplitude=tf.nn.softplus(0.1 * self._amplitude), length_scale=tf.nn.softplus(5. * self._length_scale))
+
 
 class DirectRanker(BaseEstimator):
     """
@@ -13,19 +39,22 @@ class DirectRanker(BaseEstimator):
                  # DirectRanker HPs
                  hidden_layers_dr=[256, 128, 64, 20],
                  feature_activation_dr='tanh',
-                 ranking_activation_dr='sigmoid',
+                 ranking_activation_dr='tanh',
                  feature_bias_dr=True,
                  kernel_initializer_dr=tf.random_normal_initializer,
                  kernel_regularizer_dr=0.0,
-                 drop_out=0,
+                 drop_out=0.5,
+                 GaussianNoise=0,
+                 batch_norm=True,
+                 gp_inducing_points=10,
                  # Common HPs
                  scale_factor_train_sample=5,
                  batch_size=200,
-                 loss=tf.keras.losses.MeanSquaredError(),# 'binary_crossentropy'
+                 loss=tf.keras.losses.MeanSquaredError(),
                  learning_rate=0.001,
                  learning_rate_decay_rate=1,
                  learning_rate_decay_steps=1000,
-                 optimizer=tf.keras.optimizers.Adam,# 'Nadam' 'SGD'
+                 optimizer=tf.keras.optimizers.Adam,
                  epoch=10,
                  # other variables
                  verbose=0,
@@ -45,6 +74,9 @@ class DirectRanker(BaseEstimator):
         self.kernel_initializer_dr = kernel_initializer_dr
         self.kernel_regularizer_dr = kernel_regularizer_dr
         self.drop_out = drop_out
+        self.GaussianNoise = GaussianNoise
+        self.batch_norm = batch_norm
+        self.gp_inducing_points = gp_inducing_points
         # Common HPs
         self.scale_factor_train_sample = scale_factor_train_sample
         self.batch_size = batch_size
@@ -96,9 +128,15 @@ class DirectRanker(BaseEstimator):
             activity_regularizer=tf.keras.regularizers.l2(self.kernel_regularizer_dr),
             name="nn_hidden_0"
         )(input_layer)
+ 
+        if self.GaussianNoise > 0:
+            nn = tf.keras.layers.GaussianNoise(self.GaussianNoise)(nn)
 
         if self.drop_out > 0:
             nn = tf.keras.layers.Dropout(self.drop_out)(nn)
+            
+        if self.batch_norm:
+            nn = tf.keras.layers.BatchNormalization()(nn)
 
         for i in range(1, len(self.hidden_layers_dr)):
             nn = tf.keras.layers.Dense(
@@ -111,10 +149,15 @@ class DirectRanker(BaseEstimator):
                 activity_regularizer=tf.keras.regularizers.l2(self.kernel_regularizer_dr),
                 name="nn_hidden_" + str(i)
             )(nn)
+            
+            if self.GaussianNoise > 0:
+                nn = tf.keras.layers.GaussianNoise(self.GaussianNoise)(nn)
 
             if self.drop_out > 0:
                 nn = tf.keras.layers.Dropout(self.drop_out)(nn)
-
+                
+            if self.batch_norm:
+                nn = tf.keras.layers.BatchNormalization()(nn)
 
         feature_part = tf.keras.models.Model(input_layer, nn, name='feature_part')
 
@@ -125,6 +168,9 @@ class DirectRanker(BaseEstimator):
         nn1 = feature_part(self.x1)
 
         subtracted = tf.keras.layers.Subtract()([nn0, nn1])
+        
+        if self.gp_inducing_points > 0:
+            subtracted = tfp.layers.VariationalGaussianProcess(self.gp_inducing_points, RBFKernelFn())(subtracted)
 
         out = tf.keras.layers.Dense(
             units=1,
@@ -139,7 +185,7 @@ class DirectRanker(BaseEstimator):
         self.model = tf.keras.models.Model(
             inputs=[self.x0, self.x1],
             outputs=out,
-            name='Stacker'
+            name='DR'
         )
 
         lr_schedule = tf.keras.optimizers.schedules.InverseTimeDecay(
@@ -157,6 +203,37 @@ class DirectRanker(BaseEstimator):
 
         if self.print_summary:
             self.model.summary()
+
+    def fit(self, x, y, **fit_params):
+        """
+        TODO
+        """
+        self._build_model()
+        
+        x = np.array(x)
+
+        for i in range(self.epoch):
+            
+            idx0, idx1, _ = list(zip(*[y[i] for i in np.random.randint(0, len(y), self.scale_factor_train_sample*len(y))]))
+            idx0 = np.array(idx0)
+            idx1 = np.array(idx1)
+            x0_cur = x[idx0]
+            x1_cur = x[idx1]
+
+            print('Epoch {}/{}'.format(i + 1, self.epoch))
+
+            self.model.fit(
+                x=[x0_cur, x1_cur],
+                y=np.ones(self.scale_factor_train_sample*len(y)),
+                batch_size=self.scale_factor_train_sample*self.batch_size,
+                epochs=1,
+                verbose=self.verbose,
+                shuffle=True,
+                validation_split=self.validation_size
+            )
+            # https://github.com/tensorflow/tensorflow/issues/14181
+            # https://github.com/tensorflow/tensorflow/issues/30324
+            gc.collect()
             
     def fit_gppl(self, a1_train, a2_train, items_feat, prefs_train, **fit_params):
         self._build_model()
@@ -175,38 +252,6 @@ class DirectRanker(BaseEstimator):
         )
         
         gc.collect()
-        
-
-    def fit(self, x, y, **fit_params):
-        """
-        TODO
-        """
-        self._build_model()
-
-        x0 = x[np.where(y == 1)]
-        x1 = x[np.where(y == 0)]
-
-        for i in range(self.epoch):
-            idx0 = np.random.randint(0, len(x0), self.scale_factor_train_sample*len(x))
-            idx1 = np.random.randint(0, len(x1), self.scale_factor_train_sample*len(x))
-
-            x0_cur = x0[idx0]
-            x1_cur = x1[idx1]
-
-            print('Epoch {}/{}'.format(i + 1, self.epoch))
-
-            self.model.fit(
-                x=[x0_cur, x1_cur],
-                y=np.ones(self.scale_factor_train_sample*len(y)),
-                batch_size=self.scale_factor_train_sample*self.batch_size,
-                epochs=1,
-                verbose=self.verbose,
-                shuffle=True,
-                validation_split=self.validation_size
-            )
-            # https://github.com/tensorflow/tensorflow/issues/14181
-            # https://github.com/tensorflow/tensorflow/issues/30324
-            gc.collect()
 
     def predict_proba(self, features):
         """
@@ -218,6 +263,9 @@ class DirectRanker(BaseEstimator):
         res = self.model.predict([features, np.zeros(np.shape(features))], batch_size=self.batch_size, verbose=self.verbose)
 
         return res
+    
+    def predict_ranking(self, x0, x1):
+        return self.model.predict([x0, x1], batch_size=self.batch_size, verbose=self.verbose)
 
     def predict(self, features, threshold):
         """

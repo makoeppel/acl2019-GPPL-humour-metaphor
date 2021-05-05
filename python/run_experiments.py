@@ -27,7 +27,6 @@ from operator import itemgetter
 from scipy.stats import pearsonr, spearmanr
 from sklearn.model_selection import ParameterGrid
 from vuamc import Vuamc
-from DirectRankerV2 import DirectRanker
 import tensorflow as tf
 
 import csv
@@ -451,16 +450,16 @@ def train(training_split, train_idxs, idx_instance_list, embeddings, bws=False, 
     if use_dr:
         model = DirectRanker(
             # DirectRanker HPs
-            hidden_layers_dr=hidden_layers,
+            hidden_layers_dr=[128, 64, 32, 5],
             feature_activation_dr='tanh',
-            ranking_activation_dr='sigmoid',
+            ranking_activation_dr='tanh',
             feature_bias_dr=True,
             kernel_initializer_dr=tf.random_normal_initializer,
             kernel_regularizer_dr=0.0,
             drop_out=0.5,
-            GaussianNoise=0,
+            GaussianNoise=0.1,
             batch_norm=True,
-            gp_inducing_points=10,
+            gp_inducing_points=2,
             # Common HPs
             scale_factor_train_sample=5,
             batch_size=200,
@@ -469,46 +468,48 @@ def train(training_split, train_idxs, idx_instance_list, embeddings, bws=False, 
             learning_rate_decay_rate=1,
             learning_rate_decay_steps=1000,
             optimizer=tf.keras.optimizers.Adam,
-            epoch=10,
+            epoch=5,
             # other variables
             verbose=1,
             validation_size=0.1,
-            num_features=0,
+            num_features=items_feat.shape[1],
             random_seed=42,
             name="DirectRanker",
             dtype=tf.float32,
             print_summary=True,
         )
     else:
-        model = GPPrefLearning(ninput_features=items_feat.shape[1],
-                            kernel_func=OPTIONS['kernelfunc'],  # 'matern_3_2' is default, 'diagonal' is used for testing without features
-                            ls_initial=ls_initial,
-                            verbose=False,
-                            shape_s0=2.0,
-                            rate_s0=200.0,
-                            rate_ls=rate_ls,
-                            use_svi=True,
-                            ninducing=ninducing,
-                            max_update_size=200,
-                            kernel_combination='*',
-                            forgetting_rate=0.7,
-                            delay=1.0)
-
+        model = GPPrefLearning(
+            ninput_features=items_feat.shape[1],
+            kernel_func=OPTIONS['kernelfunc'],  # 'matern_3_2' is default, 'diagonal' is used for testing without features
+            ls_initial=ls_initial,
+            verbose=False,
+            shape_s0=2.0,
+            rate_s0=200.0,
+            rate_ls=rate_ls,
+            use_svi=True,
+            ninducing=ninducing,
+            max_update_size=200,
+            kernel_combination='*',
+            forgetting_rate=0.7,
+            delay=1.0
+        )
         model.max_iter_VB = 2000
     
     # in the data loading step we already sorted each pair, preference-descending wise,
     # i.e. the first instance is always the preferred (more funny, more novel) one
     prefs_train = [1] * len(a1_train)  # 1: a1 preferred over (i.e. more novel/funny than) a2, using input_type='binary'
 
-    logging.info("**** Started training GPPL ****")
     if bws:
         pair_idx = np.unique(np.concatenate([a1_train, a2_train]))
         a1_train, a2_train, prefs_train = use_bws(a1_train, a2_train, pair_idx, prefs_train, samples=samples)
     print("items_feat", items_feat.shape, items_feat)
     print('a1_train', np.array(a1_train).shape, 'a2_train', np.array(a2_train).shape, 'prefs_train', np.array(prefs_train).shape)
     if use_dr:
+        logging.info("**** Started training DirectRanker ****")
         model.fit_gppl(np.array(a1_train), np.array(a2_train), items_feat, np.array(prefs_train, dtype=float), optimize=OPTIONS['optimization'], input_type='binary')
     else:
+        logging.info("**** Started training GPPL ****")
         model.fit(np.array(a1_train), np.array(a2_train), items_feat, np.array(prefs_train, dtype=float), optimize=OPTIONS['optimization'], input_type='binary')
     logging.info("**** Completed training GPPL ****")
 
@@ -542,7 +543,7 @@ def run(cut, cut_mode, bws, samples, use_dr):
     # currently, we retain the flexibility of loading e.g. different embeddings
     if os.path.isfile("pairs.npy"):
         pairs = np.load("pairs.npy")
-        idx_instance_list = np.load("idx_instance_list.npy")
+        idx_instance_list = np.load("idx_instance_list.npy", allow_pickle=True)
     else:
         pairs, idx_instance_list = load_crowd_data(OPTIONS['task'])
         np.save("pairs", pairs)
