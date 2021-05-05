@@ -27,6 +27,7 @@ from operator import itemgetter
 from scipy.stats import pearsonr, spearmanr
 from sklearn.model_selection import ParameterGrid
 from vuamc import Vuamc
+from DirectRankerV2 import DirectRanker
 
 import csv
 import matplotlib
@@ -458,8 +459,39 @@ def train(training_split, train_idxs, idx_instance_list, embeddings, bws=False, 
                            kernel_combination='*',
                            forgetting_rate=0.7,
                            delay=1.0)
+    
+    model = DirectRanker(
+        # DirectRanker HPs
+        hidden_layers_dr=hidden_layers,
+        feature_activation_dr='tanh',
+        ranking_activation_dr='sigmoid',
+        feature_bias_dr=True,
+        kernel_initializer_dr=tf.random_normal_initializer,
+        kernel_regularizer_dr=0.0,
+        drop_out=0.5,
+        GaussianNoise=0,
+        batch_norm=True,
+        gp_inducing_points=10,
+        # Common HPs
+        scale_factor_train_sample=5,
+        batch_size=200,
+        loss=tf.keras.losses.MeanSquaredError(),
+        learning_rate=0.001,
+        learning_rate_decay_rate=1,
+        learning_rate_decay_steps=1000,
+        optimizer=tf.keras.optimizers.Adam,
+        epoch=10,
+        # other variables
+        verbose=1,
+        validation_size=0.1,
+        num_features=0,
+        random_seed=42,
+        name="DirectRanker",
+        dtype=tf.float32,
+        print_summary=True,
+    )
 
-    model.max_iter_VB = 2000
+    #model.max_iter_VB = 2000
 
     # in the data loading step we already sorted each pair, preference-descending wise,
     # i.e. the first instance is always the preferred (more funny, more novel) one
@@ -469,7 +501,7 @@ def train(training_split, train_idxs, idx_instance_list, embeddings, bws=False, 
     if bws:
         pair_idx = np.unique(np.concatenate([a1_train, a2_train]))
         a1_train, a2_train, prefs_train = use_bws(a1_train, a2_train, pair_idx, prefs_train, samples=samples)
-    print("items_feat", items_feat.shape)
+    print("items_feat", items_feat.shape, items_feat)
     print('a1_train', np.array(a1_train).shape, 'a2_train', np.array(a2_train).shape, 'prefs_train', np.array(prefs_train).shape)
     model.fit(np.array(a1_train), np.array(a2_train), items_feat, np.array(prefs_train, dtype=float), optimize=OPTIONS['optimization'], input_type='binary')
     logging.info("**** Completed training GPPL ****")
